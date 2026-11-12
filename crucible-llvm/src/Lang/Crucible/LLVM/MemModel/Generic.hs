@@ -100,6 +100,7 @@ import qualified Data.BitVector.Sized as BV
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Ctx (SingleCtx)
+import           Data.Parameterized.NatRepr (natValue)
 import           Data.Parameterized.Some
 
 import           What4.Interface
@@ -355,7 +356,7 @@ readMemCopy ::
   LLVMPtr sym w  {- ^ The loaded offset               -} ->
   StorageType    {- ^ The type we are reading         -} ->
   SymBV sym w    {- ^ The destination of the memcopy  -} ->
-  LLVMPtr sym w  {- ^ The source of the copied region -} ->
+  LLVMPtr sym w    {- ^ The source of the copied region -} ->
   SymBV sym w    {- ^ The length of the copied region -} ->
   (StorageType -> LLVMPtr sym w -> ReadMem sym (PartLLVMVal sym)) ->
   ReadMem sym (PartLLVMVal sym)
@@ -513,11 +514,17 @@ readMemStore sym w end mop (LLVMPointer blk off) ltp d t stp loadAlign storeAlig
 
             let alignStride = fromAlignment $ min loadAlign storeAlign
 
-            -- compute the linear form of (load offset - store offset)
+            -- Compute a congruence for (load offset - store offset).
+            -- Affine offsets are evaluated modulo 2^w. Including this
+            -- modulus in the gcd makes the congruence valid after wraparound:
+            -- (a*x+b) mod 2^w is congruent to b modulo gcd(2^w, a).
+            -- In particular, the coefficient -8 has stride 8, not 2^w-8.
+            -- See #1923.
+            let modulus = 2 ^ natValue w
             let (diffStride, diffDelta)
                   | Just (load_a, _x, load_b) <- asAffineVar off
                   , Just (store_a, _y, store_b) <- asAffineVar d = do
-                    let stride' = gcd
+                    let stride' = gcd modulus $ gcd
                           (BV.asUnsigned (W4.fromConcreteBV load_a))
                           (BV.asUnsigned (W4.fromConcreteBV store_a))
                     -- mod returns a non-negative integer
@@ -528,12 +535,12 @@ readMemStore sym w end mop (LLVMPointer blk off) ltp d t stp loadAlign storeAlig
                     (fromInteger stride', fromInteger delta')
                   | Just (load_a, _x, load_b) <- asAffineVar off
                   , Just store_b <- BV.asUnsigned <$> asBV d = do
-                    let stride' = BV.asUnsigned (W4.fromConcreteBV load_a)
+                    let stride' = gcd modulus (BV.asUnsigned (W4.fromConcreteBV load_a))
                     let delta' = mod (BV.asUnsigned (W4.fromConcreteBV load_b) - store_b) stride'
                     (fromInteger stride', fromInteger delta')
                   | Just load_b <- BV.asUnsigned <$> asBV off
                   , Just (store_a, _y, store_b) <- asAffineVar d = do
-                    let stride' = BV.asUnsigned (W4.fromConcreteBV store_a)
+                    let stride' = gcd modulus (BV.asUnsigned (W4.fromConcreteBV store_a))
                     let delta' = mod (load_b - BV.asUnsigned (W4.fromConcreteBV store_b)) stride'
                     (fromInteger stride', fromInteger delta')
                   | otherwise = (1, 0)
@@ -1431,7 +1438,7 @@ setMem ::
   sym -> NatRepr w ->
   LLVMPtr sym w {- ^ Pointer -} ->
   SymBV sym 8 {- ^ Byte value -} ->
-  SymBV sym w {- ^ Number of bytes to set -} ->
+  SymBV sym w   {- ^ Number of bytes to set -} ->
   Mem sym -> IO (Mem sym, Pred sym)
 
 setMem sym w ptr val sz m =
